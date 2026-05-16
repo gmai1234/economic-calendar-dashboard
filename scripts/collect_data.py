@@ -1,21 +1,13 @@
 #!/usr/bin/env python3
 """
 Economic Calendar Dashboard Data Collector — Phase 1: BLS ICS
-- Fetches BLS Economic News Release Schedule (ICS format, iCalendar)
-- Parses VEVENT blocks
-- Outputs calendar_data.js (future events, up to 180 days)
-
-Env:
-  (none required — BLS ICS is public)
-
-Phase 2 후보 (현재는 BLS 만):
-  - BEA: https://apps.bea.gov/iTable/calendar/CY/all/  (ICS 없음, HTML 또는 RSS)
-  - Fed FOMC: https://www.federalreserve.gov/json/fomc-meetings.json (자체 API 가능성)
-  - Treasury: https://www.treasurydirect.gov/auctions/upcoming/
+Fetches BLS Economic News Release Schedule (ICS), parses VEVENTs, outputs calendar_data.js.
 """
 
 import json
 import sys
+import time
+import traceback
 import urllib.request
 from datetime import datetime, date, timezone, timedelta
 
@@ -26,17 +18,30 @@ MAX_EVENTS = 50
 DAYS_AHEAD = 180
 
 
-def fetch_text(url, timeout=30):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "economic-calendar-dashboard/1.0 (+https://github.com/gmai1234)",
-        "Accept": "text/calendar, text/html, */*"
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
+def fetch_text(url, timeout=30, max_retries=3):
+    """Fetch with Mozilla-like UA + retry on transient errors."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; economic-calendar-dashboard/1.0; +https://github.com/gmai1234)",
+                "Accept": "text/calendar, text/html, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                code = resp.getcode()
+                if code >= 500:
+                    raise RuntimeError(f"HTTP {code}")
+                return resp.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            last_err = e
+            print(f"  attempt {attempt+1}/{max_retries} failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+    raise last_err
 
 
 def parse_ics(ics_text):
-    """Parse VEVENT blocks. Returns list of dicts (raw key→value)."""
     events = []
     cur = None
     for raw in ics_text.splitlines():
@@ -57,7 +62,6 @@ def parse_ics(ics_text):
 
 
 def parse_dt(dt_str):
-    """ICS DTSTART value like '20251210T083000' or '20251210' -> datetime."""
     s = (dt_str or '').rstrip('Z').strip()
     if not s:
         return None
@@ -98,27 +102,29 @@ def filter_future(events, today, horizon, max_count):
 
 
 def main():
-    print(f"Fetching BLS ICS calendar...", flush=True)
+    print(f"Fetching BLS ICS calendar: {BLS_ICS_URL}", flush=True)
     try:
         ics_text = fetch_text(BLS_ICS_URL)
     except Exception as e:
-        print(f"ERROR: BLS ICS fetch failed: {e}", file=sys.stderr)
+        print(f"\nFATAL: BLS ICS fetch failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
         sys.exit(1)
     print(f"  Fetched {len(ics_text):,} bytes", flush=True)
 
     events = parse_ics(ics_text)
-    print(f"  Parsed {len(events)} total VEVENTs", flush=True)
+    print(f"  Parsed {len(events)} VEVENTs", flush=True)
 
     today = date.today()
     horizon = today + timedelta(days=DAYS_AHEAD)
     future = filter_future(events, today, horizon, MAX_EVENTS)
     print(f"  Future events (today..+{DAYS_AHEAD}d): {len(future)}", flush=True)
 
+    if not future:
+        print(f"WARNING: No future events found. Today: {today}", file=sys.stderr, flush=True)
+
     payload = {
         'releases': future,
-        'sources': {
-            'BLS': BLS_ICS_URL,
-        },
+        'sources': {'BLS': BLS_ICS_URL},
         'collected_at': datetime.now(KST).strftime('%Y-%m-%dT%H:%M:%S+09:00'),
         'count': len(future),
     }
@@ -132,7 +138,7 @@ def main():
         t = r['time_et'] or '----'
         print(f"  {r['date']} {t}  D-{r['days_until']:3}  {r['summary']}", flush=True)
 
-    print(f"\nWrote {OUTPUT_PATH}", flush=True)
+    print(f"\nWrote {OUTPUT_PATH} ({len(js_content):,} bytes)", flush=True)
 
 
 if __name__ == '__main__':
